@@ -200,6 +200,35 @@ def _format_prompt(prompt: str, tokenizer, image_token: str = DEFAULT_IMAGE_TOKE
     return FALLBACK_PROMPT_TEMPLATE.format(content=user_content)
 
 
+def _tokenizer_image_token(
+    prompt: str,
+    tokenizer,
+    image_token_id: int,
+    image_token: str = DEFAULT_IMAGE_TOKEN,
+) -> torch.Tensor:
+    """Tokeniza um prompt onde `image_token` vira `image_token_id` (sentinel).
+
+    Convencao LLaVA / TinyLLaVA: `image_token_id` pode ser fora do vocab
+    (tipicamente -200). O tokenizer nao consegue produzi-lo a partir de
+    `<image>` literal — entao quebramos o prompt em chunks por `<image>`,
+    tokenizamos cada chunk e intercalamos `image_token_id` entre eles.
+
+    `add_special_tokens` so e True para o primeiro chunk (evita BOS duplicado).
+    """
+    chunks = prompt.split(image_token)
+    if len(chunks) == 1:
+        ids = tokenizer(prompt, add_special_tokens=True).input_ids
+        return torch.tensor([ids], dtype=torch.long)
+
+    input_ids: list[int] = []
+    for i, chunk in enumerate(chunks):
+        chunk_ids = tokenizer(chunk, add_special_tokens=(i == 0)).input_ids
+        if i > 0:
+            input_ids.append(image_token_id)
+        input_ids.extend(chunk_ids)
+    return torch.tensor([input_ids], dtype=torch.long)
+
+
 def _find_placeholder_position(input_ids: torch.Tensor, image_token_id: int) -> int:
     ids = input_ids[0].tolist()
     positions = [i for i, t in enumerate(ids) if t == image_token_id]
@@ -276,9 +305,9 @@ def extract_vlm_attention(
     formatted = _format_prompt(prompt, tokenizer, image_token=image_token)
     notes.append(f"prompt_formatado={formatted!r}")
 
-    text_inputs = tokenizer(formatted, return_tensors="pt").to(device)
-    input_ids: torch.Tensor = text_inputs["input_ids"]
+    input_ids = _tokenizer_image_token(formatted, tokenizer, img_tok_id, image_token).to(device)
     prompt_len = int(input_ids.shape[1])
+    attention_mask = torch.ones_like(input_ids, device=device)
 
     image_inputs = image_processor(image, return_tensors="pt")
     pixel_values: torch.Tensor = image_inputs["pixel_values"].to(device)
@@ -290,6 +319,7 @@ def extract_vlm_attention(
 
     gen_kwargs: dict[str, Any] = dict(
         input_ids=input_ids,
+        attention_mask=attention_mask,
         images=pixel_values,
         image_sizes=[image.size],
         max_new_tokens=max_new_tokens,
@@ -298,8 +328,6 @@ def extract_vlm_attention(
         return_dict_in_generate=True,
         output_attentions=True,
     )
-    if "attention_mask" in text_inputs:
-        gen_kwargs["attention_mask"] = text_inputs["attention_mask"]
 
     output = model.generate(**gen_kwargs)
 

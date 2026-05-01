@@ -317,8 +317,11 @@ def extract_vlm_attention(
     placeholder_pos = _find_placeholder_position(input_ids, img_tok_id)
     notes.append(f"placeholder_pos={placeholder_pos}, prompt_len={prompt_len}")
 
-    gen_kwargs: dict[str, Any] = dict(
-        input_ids=input_ids,
+    # ATENCAO: TinyLLaVA define `generate(self, inputs, images, image_sizes, **kwargs)`.
+    # `inputs` e posicional — passar como kwarg `input_ids=` cai no **kwargs e
+    # `inputs` fica None, quebrando `prepare_inputs_labels_for_multimodal`.
+    output = model.generate(
+        input_ids,
         attention_mask=attention_mask,
         images=pixel_values,
         image_sizes=[image.size],
@@ -328,8 +331,6 @@ def extract_vlm_attention(
         return_dict_in_generate=True,
         output_attentions=True,
     )
-
-    output = model.generate(**gen_kwargs)
 
     if not getattr(output, "attentions", None):
         raise RuntimeError(

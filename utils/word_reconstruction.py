@@ -1,29 +1,40 @@
-"""Reconstrucao de palavras a partir de tokens BPE/SentencePiece.
+"""Reconstrucao de palavras a partir de tokens BPE/SentencePiece/WordPiece.
 
 Modulo de apoio ao protocolo de inspecao qualitativa de heatmaps de
 atencao (`notas/metodologia/protocolo-inspecao-heatmap.md`).
 
-Trata trees centrais:
-1. Subwords (e.g. `_chap` + `eu` -> "chapeu") sao agregados na unidade
-   de classificacao do protocolo: a palavra reconstruida.
+Trata tres centrais:
+1. Subwords (e.g. SP `_chap` + `eu` ou WP `chap` + `##eu` -> "chapeu")
+   sao agregados na unidade de classificacao do protocolo: a palavra
+   reconstruida.
 2. Stopwords sao identificadas via lista PT-BR fixa; categorias
    permitidas para elas no protocolo sao restritas a DIFUSO/ARTEFATO.
 3. Variabilidade de atencao entre subwords ("drift") e diagnostico
    de instabilidade autoregressiva intra-palavra.
 
-LlamaTokenizer/SentencePiece marca inicio de palavra com U+2581
-(`_`, "lower one eighth block"). Subwords seguintes nao tem prefixo.
+Tokenizers suportados:
+- SentencePiece (LlamaTokenizer / ViTucano): inicio de palavra marcado
+  com prefixo U+2581 (`_`, "lower one eighth block"); continuacoes
+  sem prefixo.
+- WordPiece (BERT / DistilBERTimbau / Swin-DistilBERTimbau): inicio de
+  palavra **sem** prefixo; continuacoes marcadas com `##`.
+
+Convencoes inversas, mesmo algoritmo de agrupamento (parametrizado por
+`tokenizer_kind`).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Iterable, Literal
 
 import numpy as np
 
 
-SP_WORD_PREFIX = "▁"  # SentencePiece: inicio de palavra
+SP_WORD_PREFIX = "▁"   # SentencePiece: inicio de palavra
+WP_CONT_PREFIX = "##"  # WordPiece: continuacao de palavra
+
+TokenizerKind = Literal["sentencepiece", "wordpiece", "auto"]
 
 
 # Stopwords PT-BR (lista operacional do protocolo).
@@ -75,47 +86,117 @@ class ReconstructedWord:
         return self.n_subwords > 1
 
 
-def _strip_sp_prefix(token: str) -> str:
-    """Remove prefixo SentencePiece se presente."""
-    if token.startswith(SP_WORD_PREFIX):
+def _strip_prefix(token: str, kind: TokenizerKind) -> str:
+    """Remove prefixo do tokenizer, se presente.
+
+    SentencePiece: remove `_` (U+2581) inicial.
+    WordPiece: remove `##` inicial.
+    """
+    if kind == "sentencepiece" and token.startswith(SP_WORD_PREFIX):
         return token[len(SP_WORD_PREFIX):]
+    if kind == "wordpiece" and token.startswith(WP_CONT_PREFIX):
+        return token[len(WP_CONT_PREFIX):]
     return token
 
 
-def reconstruct_words(tokens: Iterable[str]) -> list[ReconstructedWord]:
+def _starts_word(token: str, kind: TokenizerKind) -> bool:
+    """Verifica se o token inicia uma nova palavra na convencao do tokenizer."""
+    if kind == "sentencepiece":
+        return token.startswith(SP_WORD_PREFIX)
+    if kind == "wordpiece":
+        return not token.startswith(WP_CONT_PREFIX)
+    raise ValueError(f"tokenizer_kind nao resolvido: {kind!r}")
+
+
+def detect_tokenizer_kind(
+    tokens: Iterable[str],
+) -> Literal["sentencepiece", "wordpiece"]:
+    """Auto-deteccao do tokenizer a partir da convencao dos tokens.
+
+    Heuristica:
+    - Se algum token comeca com `_` (U+2581) -> sentencepiece
+    - Se algum token comeca com `##` -> wordpiece
+    - Default (nenhuma marca encontrada): assume wordpiece, pois
+      strings sem marca sao validas WP (todos sao inicios de palavra).
+
+    Args:
+        tokens: lista de tokens.
+
+    Returns:
+        "sentencepiece" ou "wordpiece".
+    """
+    has_sp = False
+    has_wp = False
+    for tok in tokens:
+        if tok in SPECIAL_TOKENS:
+            continue
+        if tok.startswith(SP_WORD_PREFIX):
+            has_sp = True
+        if tok.startswith(WP_CONT_PREFIX):
+            has_wp = True
+        if has_sp and has_wp:
+            break
+
+    if has_sp and not has_wp:
+        return "sentencepiece"
+    if has_wp and not has_sp:
+        return "wordpiece"
+    if has_sp and has_wp:
+        # Caso anomalo: convencao mista. Privilegiar SP (mais informativo).
+        return "sentencepiece"
+    # Nenhuma marca: WP por construcao
+    return "wordpiece"
+
+
+def reconstruct_words(
+    tokens: Iterable[str],
+    tokenizer_kind: TokenizerKind = "auto",
+) -> list[ReconstructedWord]:
     """Agrupa subwords contiguos em palavras.
 
-    Uma palavra inicia em todo token com prefixo `_` (U+2581) ou no
-    primeiro token da sequencia. Tokens subsequentes sem prefixo
-    sao anexados a palavra atual.
+    Convencao depende do `tokenizer_kind`:
+
+    - `sentencepiece`: palavra inicia em todo token com prefixo `_`
+      (U+2581) ou no primeiro token. Continuacoes nao tem prefixo.
+    - `wordpiece`: palavra inicia em todo token **sem** prefixo `##`
+      ou no primeiro token. Continuacoes tem prefixo `##`.
+    - `auto`: detectar via `detect_tokenizer_kind`.
 
     Tokens especiais (vide `SPECIAL_TOKENS`) sao tratados como
     palavras isoladas independente de prefixo.
 
     Args:
-        tokens: lista de tokens BPE/SP do tokenizer (string).
+        tokens: lista de tokens (string).
+        tokenizer_kind: "sentencepiece" | "wordpiece" | "auto".
 
     Returns:
         Lista de `ReconstructedWord` na ordem de geracao.
     """
+    tokens_list = list(tokens)
+
+    if tokenizer_kind == "auto":
+        kind: Literal["sentencepiece", "wordpiece"] = detect_tokenizer_kind(tokens_list)
+    else:
+        kind = tokenizer_kind
+
     words: list[ReconstructedWord] = []
     current: ReconstructedWord | None = None
 
-    for idx, tok in enumerate(tokens):
+    for idx, tok in enumerate(tokens_list):
         is_special = tok in SPECIAL_TOKENS
-        starts_word = tok.startswith(SP_WORD_PREFIX) or is_special or current is None
+        starts_word = is_special or current is None or _starts_word(tok, kind)
 
         if starts_word:
             if current is not None:
                 words.append(current)
             current = ReconstructedWord(
-                text=_strip_sp_prefix(tok) if not is_special else tok,
+                text=_strip_prefix(tok, kind) if not is_special else tok,
                 subword_indices=[idx],
                 subword_tokens=[tok],
             )
         else:
             assert current is not None
-            current.text += _strip_sp_prefix(tok)
+            current.text += _strip_prefix(tok, kind)
             current.subword_indices.append(idx)
             current.subword_tokens.append(tok)
 
@@ -281,6 +362,7 @@ def build_word_table(
     attn_grid: np.ndarray,
     captions: Iterable[str] | None = None,
     grid_shape: tuple[int, int] | None = None,
+    tokenizer_kind: TokenizerKind = "auto",
 ) -> list[dict]:
     """Pipeline completo: tokens -> tabela pronta para a Etapa 2.
 
@@ -300,11 +382,12 @@ def build_word_table(
         captions: iteravel de captions de referencia (5+5 do dataset).
             Se None, n_refs = -1 e tipo nao distingue cons/iso.
         grid_shape: opcional (H, W).
+        tokenizer_kind: "sentencepiece" | "wordpiece" | "auto".
 
     Returns:
         Lista de dicts ordenada por w.
     """
-    words = reconstruct_words(tokens)
+    words = reconstruct_words(tokens, tokenizer_kind=tokenizer_kind)
 
     if captions is not None:
         noun_counts = extract_nouns_from_captions(captions)

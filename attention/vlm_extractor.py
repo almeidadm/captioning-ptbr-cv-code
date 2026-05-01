@@ -144,20 +144,28 @@ def _get_forward_params(model):
 
 
 def _estimate_grid_shape(n_visual: int) -> tuple[int, int]:
-    """Infere grid (H, W) com H*W = n_visual ou H*W = n_visual - 1 (caso CLS).
+    """Infere grid (H, W) com H*W = n_visual exatamente.
 
-    Casos comuns para ViT/SigLIP: 196 (14x14), 256 (16x16), 576 (24x24), 729 (27x27).
+    Estrategia:
+      1. Se n_visual e quadrado perfeito -> (sqrt(N), sqrt(N)).
+      2. Caso contrario, par de fatores (h, w) com h <= w mais proximo de quadrado.
+
+    Casos comuns:
+      - 196 -> (14, 14)
+      - 256 -> (16, 16)
+      - 576 -> (24, 24)
+      - 729 -> (27, 27)
+      - 728 -> (26, 28)  # SigLIP 27x27 com 1 token droppado (provavel CLS)
+      - 575 -> (23, 25)  # 576 - 1
     """
-    h = int(round(math.sqrt(n_visual)))
-    if h * h == n_visual:
-        return (h, h)
-    h = int(round(math.sqrt(n_visual - 1)))
-    if h * h == n_visual - 1:
-        return (h, h)
-    raise ValueError(
-        f"Nao foi possivel inferir grid quadrado para n_visual={n_visual}; "
-        "passar grid_shape explicito."
-    )
+    if n_visual <= 0:
+        raise ValueError(f"n_visual deve ser positivo, recebido {n_visual}")
+    h = math.isqrt(n_visual)
+    while h > 0:
+        if n_visual % h == 0:
+            return (h, n_visual // h)
+        h -= 1
+    return (1, n_visual)
 
 
 def _resolve_image_token_id(model, tokenizer, override: int | None) -> int:
@@ -377,18 +385,11 @@ def extract_vlm_attention(
 
         visual_slice = last_query[visual_start:visual_end]
         if visual_slice.shape[0] != expected_count:
-            if visual_slice.shape[0] > expected_count:
-                if t == 0:
-                    notes.append(
-                        f"slice ({visual_slice.shape[0]}) > H*W ({expected_count}); "
-                        "truncando para os ultimos H*W (assumindo CLS)."
-                    )
-                visual_slice = visual_slice[-expected_count:]
-            else:
-                raise RuntimeError(
-                    f"step {t}: slice visual {visual_slice.shape[0]} elementos, "
-                    f"esperado {expected_count} (grid {grid_shape})."
-                )
+            raise RuntimeError(
+                f"step {t}: slice visual {visual_slice.shape[0]} elementos, "
+                f"esperado {expected_count} (grid {grid_shape}). "
+                "Verifique grid_shape ou n_visual_tokens."
+            )
 
         grid = visual_slice.float().cpu().numpy().reshape(H, W)
         attn_grids.append(grid)

@@ -27,10 +27,16 @@ class ProjectPaths:
     anotacao_manual: Path
 
     def make_dirs(self) -> None:
-        """Cria toda a arvore de pastas se ainda nao existir."""
-        for attr, value in self.__dict__.items():
-            if isinstance(value, Path):
-                value.mkdir(parents=True, exist_ok=True)
+        """Cria toda a arvore de pastas se ainda nao existir.
+
+        Paths com sufixo de arquivo (ex: .parquet, .json) tem o pai
+        criado em vez do proprio caminho.
+        """
+        for value in self.__dict__.values():
+            if not isinstance(value, Path):
+                continue
+            target = value.parent if value.suffix else value
+            target.mkdir(parents=True, exist_ok=True)
 
 
 def get_drive_paths(root: Path | str | None = None) -> ProjectPaths:

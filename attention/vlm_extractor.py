@@ -367,10 +367,19 @@ def extract_vlm_attention(
     H, W = grid_shape
     expected_count = H * W
 
+    # TinyLLaVA passa inputs_embeds (nao input_ids) ao super().generate(),
+    # entao output.sequences contem APENAS os tokens gerados — sem o prompt.
+    # Para outros modelos, sequences inclui o prompt no inicio.
+    # `len(output.attentions)` e sempre o numero exato de passos de geracao.
+    n_gen_steps = len(output.attentions)
     full_seq = output.sequences[0]
-    new_tokens = full_seq[prompt_len:]
+    new_tokens = full_seq[-n_gen_steps:] if full_seq.shape[0] >= n_gen_steps else full_seq
     caption = tokenizer.decode(new_tokens, skip_special_tokens=True)
     generated_strs = tokenizer.convert_ids_to_tokens(new_tokens.tolist())
+    notes.append(
+        f"sequences_len={full_seq.shape[0]}, n_gen_steps={n_gen_steps}, "
+        f"prompt_in_sequences={'sim' if full_seq.shape[0] > n_gen_steps else 'nao'}"
+    )
 
     attn_grids: list[np.ndarray] = []
     raw_per_step: list[np.ndarray] = []
